@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,9 +7,9 @@ import pickle
 import uvicorn
 import io
 
-# ------------------------------------------------------
-# LOAD MODEL + ENCODERS + FEATURE COLUMNS
-# ------------------------------------------------------
+# -----------------------
+# Load Model + Artifacts
+# -----------------------
 with open("model.pkl", "rb") as f:
     model = pickle.load(f)
 
@@ -18,22 +19,26 @@ with open("label_encoders.pkl", "rb") as f:
 with open("feature_columns.pkl", "rb") as f:
     feature_columns = pickle.load(f)
 
-# ------------------------------------------------------
-# FASTAPI APP SETUP
-# ------------------------------------------------------
-app = FastAPI(title="Healthcare Test Result Prediction API")
+# -------- FEATURE NAME NORMALIZATION LAYER --------
+FEATURE_MAP = {
+    "Blood_Type": "Blood Type",
+    "Medical_Condition": "Medical Condition",
+    "Billing_Amount": "Billing Amount",
+    "Admission_Type": "Admission Type",
+}
+
+app = FastAPI(title="Healthcare Test Prediction API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Your React/Vercel frontend works
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------
-# REQUEST SCHEMA (Matches EXACT model training)
-# ------------------------------------------------------
+# -----------------------
+# Request Schema
+# -----------------------
 class PredictRequest(BaseModel):
     Age: float
     Gender: int
@@ -52,129 +57,95 @@ class PredictRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "OK", "message": "Backend API running successfully!"}
+    return {"status": "online", "message": "Healthcare Test Prediction API"}
 
 
-# ------------------------------------------------------
-# 🔥 SINGLE PREDICTION ENDPOINT
-# ------------------------------------------------------
+# -----------------------
+# Single Prediction
+# -----------------------
 @app.post("/predict")
 def predict(req: PredictRequest):
-
     try:
-        # Convert input to dataframe
-        df = pd.DataFrame([req.dict()])
+        data = req.dict()
 
-        # ----------------------------------------
-        # Apply label encoders (ONLY for columns that need it)
-        # ----------------------------------------
-        for col in df.columns:
-            if col in label_encoders:
+        # Convert FE field names → training names
+        renamed = {}
+        for k, v in data.items():
+            if k in FEATURE_MAP:
+                renamed[FEATURE_MAP[k]] = v
+            else:
+                renamed[k.replace("_", " ")] = v
+
+        df = pd.DataFrame([renamed])
+
+        # Apply label encoders
+        for col, enc in label_encoders.items():
+            if col in df.columns:
                 try:
-                    df[col] = label_encoders[col].transform(df[col].astype(str))
-                except Exception:
-                    pass   # already encoded
+                    df[col] = enc.transform(df[col].astype(str))
+                except:
+                    pass
 
-        # ----------------------------------------
-        # Ensure feature order matches training
-        # ----------------------------------------
+        # Validate features
         missing = [c for c in feature_columns if c not in df.columns]
         if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing required features: {missing}"
-            )
+            raise HTTPException(400, f"Missing required features: {missing}")
 
         df = df[feature_columns]
 
-        # ----------------------------------------
-        # Prediction
-        # ----------------------------------------
-        pred = model.predict(df)[0]
+        pred = int(model.predict(df)[0])
 
-        # Decode test result label
-        label_encoder_key = None
-        for k in label_encoders:
-            if "test" in k.lower():
-                label_encoder_key = k
-                break
-
-        if label_encoder_key:
-            decoded_label = label_encoders[label_encoder_key].inverse_transform([pred])[0]
+        # Decode label
+        if "Test_Results" in label_encoders:
+            label = label_encoders["Test_Results"].inverse_transform([pred])[0]
         else:
-            label_map = {0: "ABNORMAL", 1: "INCONCLUSIVE", 2: "NORMAL"}
-            decoded_label = label_map.get(int(pred), str(pred))
+            label_map = {0: "Abnormal", 1: "Inconclusive", 2: "Normal"}
+            label = label_map.get(pred, pred)
 
-        return {
-            "prediction_encoded": int(pred),
-            "prediction_label": decoded_label
-        }
+        return {"prediction_encoded": pred, "prediction_label": label}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 
-# ------------------------------------------------------
-# 🔥 CSV BATCH PREDICTION
-# ------------------------------------------------------
+# -----------------------
+# Batch Prediction
+# -----------------------
 @app.post("/predict_batch")
 async def predict_batch(file: UploadFile = File(...)):
-
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
 
-        original = df.copy()
+        # Rename columns if needed
+        df = df.rename(columns=FEATURE_MAP)
 
-        # Apply encoders
-        for col in df.columns:
-            if col in label_encoders:
+        for col, enc in label_encoders.items():
+            if col in df.columns:
                 try:
-                    df[col] = label_encoders[col].transform(df[col].astype(str))
-                except Exception:
+                    df[col] = enc.transform(df[col].astype(str))
+                except:
                     pass
 
-        # Ensure every required feature is present
         missing = [c for c in feature_columns if c not in df.columns]
         if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing required features in CSV: {missing}"
-            )
+            raise HTTPException(400, f"Missing required features in CSV: {missing}")
 
-        X = df[feature_columns]
-        preds = model.predict(X)
+        preds = model.predict(df[feature_columns])
 
-        original["prediction_encoded"] = preds
+        df["prediction_encoded"] = preds
 
-        # Decode labels
-        label_encoder_key = None
-        for k in label_encoders:
-            if "test" in k.lower():
-                label_encoder_key = k
-                break
+        label_map = {0: "Abnormal", 1: "Inconclusive", 2: "Normal"}
+        df["prediction_label"] = [label_map[int(p)] for p in preds]
 
-        if label_encoder_key:
-            original["prediction_label"] = label_encoders[label_encoder_key].inverse_transform(preds)
-        else:
-            label_map = {0: "ABNORMAL", 1: "INCONCLUSIVE", 2: "NORMAL"}
-            original["prediction_label"] = [label_map[int(p)] for p in preds]
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
 
-        buf = io.BytesIO()
-        original.to_csv(buf, index=False)
-        buf.seek(0)
-
-        return {
-            "filename": f"predictions_{file.filename}",
-            "content": buf.getvalue().decode()
-        }
+        return {"filename": file.filename, "content": buf.getvalue()}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 
-# ------------------------------------------------------
-# Production entrypoint
-# ------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
