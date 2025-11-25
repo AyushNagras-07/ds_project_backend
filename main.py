@@ -19,12 +19,22 @@ with open("label_encoders.pkl", "rb") as f:
 with open("feature_columns.pkl", "rb") as f:
     feature_columns = pickle.load(f)
 
-# -------- FEATURE NAME NORMALIZATION LAYER --------
+# Maps frontend names → model training names
 FEATURE_MAP = {
     "Blood_Type": "Blood Type",
     "Medical_Condition": "Medical Condition",
     "Billing_Amount": "Billing Amount",
     "Admission_Type": "Admission Type",
+}
+
+# Columns that MUST NOT be renamed with spaces
+SAFE_COLUMNS = {
+    "Symptom_Severity",
+    "Prior_Hospital_Visits",
+    "High_BP_Flag",
+    "High_Sugar_Flag",
+    "Fever_Flag",
+    "Risk_Score",
 }
 
 app = FastAPI(title="Healthcare Test Prediction API")
@@ -57,7 +67,7 @@ class PredictRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "online", "message": "Healthcare Test Prediction API"}
+    return {"status": "online"}
 
 
 # -----------------------
@@ -67,18 +77,25 @@ def root():
 def predict(req: PredictRequest):
     try:
         data = req.dict()
-
-        # Convert FE field names → training names
         renamed = {}
+
+        # Rename columns safely
         for k, v in data.items():
-            if k in FEATURE_MAP:
+
+            if k in SAFE_COLUMNS:     # Keep EXACT NAME
+                renamed[k] = v
+                continue
+
+            if k in FEATURE_MAP:      # Convert FE → Training
                 renamed[FEATURE_MAP[k]] = v
-            else:
-                renamed[k.replace("_", " ")] = v
+                continue
+
+            # Default: replace _ with space
+            renamed[k.replace("_", " ")] = v
 
         df = pd.DataFrame([renamed])
 
-        # Apply label encoders
+        # Apply encoders
         for col, enc in label_encoders.items():
             if col in df.columns:
                 try:
@@ -95,12 +112,8 @@ def predict(req: PredictRequest):
 
         pred = int(model.predict(df)[0])
 
-        # Decode label
-        if "Test_Results" in label_encoders:
-            label = label_encoders["Test_Results"].inverse_transform([pred])[0]
-        else:
-            label_map = {0: "Abnormal", 1: "Inconclusive", 2: "Normal"}
-            label = label_map.get(pred, pred)
+        label_map = {0: "Abnormal", 1: "Inconclusive", 2: "Normal"}
+        label = label_map.get(pred, pred)
 
         return {"prediction_encoded": pred, "prediction_label": label}
 
@@ -117,9 +130,10 @@ async def predict_batch(file: UploadFile = File(...)):
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
 
-        # Rename columns if needed
+        # Apply renaming
         df = df.rename(columns=FEATURE_MAP)
 
+        # Apply encoders
         for col, enc in label_encoders.items():
             if col in df.columns:
                 try:
@@ -132,7 +146,6 @@ async def predict_batch(file: UploadFile = File(...)):
             raise HTTPException(400, f"Missing required features in CSV: {missing}")
 
         preds = model.predict(df[feature_columns])
-
         df["prediction_encoded"] = preds
 
         label_map = {0: "Abnormal", 1: "Inconclusive", 2: "Normal"}
